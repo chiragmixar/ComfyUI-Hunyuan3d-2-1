@@ -22,7 +22,7 @@ from PIL import Image
 from typing import List
 from .DifferentiableRenderer.MeshRender import MeshRender
 from .utils.simplify_mesh_utils import remesh_mesh
-from .utils.multiview_utils import multiviewDiffusionNet
+from .utils.multiview_utils import multiviewDiffusionNet, get_cached_multiview_model
 from .utils.pipeline_utils import ViewProcessor
 #from .utils.image_super_utils import imageSuperNet
 from .utils.uvwrap_utils import mesh_uv_wrap
@@ -113,8 +113,10 @@ class Hunyuan3DPaintPipeline:
     @torch.no_grad()
     def __call__(self, mesh, image_path=None, output_mesh_path=None, use_remesh=False, save_glb=True, num_steps=10, guidance_scale=3.0, unwrap=True, seed=0):
         """Generate texture for 3D mesh using multiview diffusion"""
-        if self.model == None:
-            self.model = multiviewDiffusionNet(self.config)
+        # Use cached model instead of creating new one each time
+        if self.model is None:
+            # Use the global cached model to avoid reloading from HuggingFace
+            self.model = get_cached_multiview_model(self.config)
         
         # Ensure image_prompt is a list
         if isinstance(image_path, str):

@@ -24,6 +24,52 @@ from diffusers import DiffusionPipeline
 from diffusers import EulerAncestralDiscreteScheduler, DDIMScheduler, UniPCMultistepScheduler
 from ..hunyuanpaintpbr.pipeline import HunyuanPaintPipeline
 
+# Global cache for multiviewDiffusionNet instances
+# Key: (device, multiview_cfg_path, custom_pipeline) tuple
+# Value: multiviewDiffusionNet instance
+_MULTIVIEW_MODEL_CACHE = {}
+_MULTIVIEW_CACHE_LOCK = None  # For thread safety if needed
+
+def get_cached_multiview_model(config):
+    """
+    Get a cached multiviewDiffusionNet instance or create a new one.
+    This avoids reloading the HuggingFace model on every generation.
+    """
+    global _MULTIVIEW_MODEL_CACHE
+    
+    # Create a cache key from config parameters that affect model loading
+    cache_key = (
+        config.device,
+        config.multiview_cfg_path,
+        config.custom_pipeline,
+        config.multiview_pretrained_path,
+    )
+    
+    if cache_key not in _MULTIVIEW_MODEL_CACHE:
+        print(f"[Pipeline Cache] Creating new multiviewDiffusionNet instance (cache miss)")
+        _MULTIVIEW_MODEL_CACHE[cache_key] = multiviewDiffusionNet(config)
+        print(f"[Pipeline Cache] Model cached successfully")
+    else:
+        print(f"[Pipeline Cache] Reusing cached multiviewDiffusionNet instance (cache hit)")
+        # Ensure the pipeline is on the correct device before reuse
+        cached_model = _MULTIVIEW_MODEL_CACHE[cache_key]
+        try:
+            # Move pipeline components back to CUDA if they were offloaded
+            if hasattr(cached_model.pipeline, 'to'):
+                cached_model.pipeline.to(config.device)
+            print(f"[Pipeline Cache] Pipeline moved to {config.device}")
+        except Exception as e:
+            print(f"[Pipeline Cache] Warning: Could not move pipeline to device: {e}")
+    
+    return _MULTIVIEW_MODEL_CACHE[cache_key]
+
+def clear_multiview_cache():
+    """Clear the global model cache to free memory."""
+    global _MULTIVIEW_MODEL_CACHE
+    _MULTIVIEW_MODEL_CACHE.clear()
+    torch.cuda.empty_cache()
+    print("[Pipeline Cache] Cleared multiview model cache")
+
 
 class multiviewDiffusionNet:
     def __init__(self, config) -> None:
@@ -35,13 +81,15 @@ class multiviewDiffusionNet:
         self.cfg = cfg
         self.mode = self.cfg.model.params.stable_diffusion_config.custom_pipeline[2:]
 
+        print(f"[Pipeline Cache] Loading model from HuggingFace Hub...")
         model_path = huggingface_hub.snapshot_download(
             repo_id=config.multiview_pretrained_path,
             allow_patterns=["hunyuan3d-paintpbr-v2-1/*"],
         )
 
         model_path = os.path.join(model_path, "hunyuan3d-paintpbr-v2-1")
-                
+        
+        print(f"[Pipeline Cache] Loading HunyuanPaintPipeline from {model_path}...")
         pipeline = HunyuanPaintPipeline.from_pretrained(
             model_path,
             torch_dtype=torch.float16
@@ -51,10 +99,13 @@ class multiviewDiffusionNet:
         pipeline.set_progress_bar_config(disable=False)
         pipeline.eval()
         setattr(pipeline, "view_size", cfg.model.params.get("view_size", 320))
-        pipeline.enable_model_cpu_offload()
+        # NOTE: Disabled CPU offload to fix device mismatch when reusing cached pipeline
+        # The pipeline will stay in VRAM which is fine since we're caching it
+        # pipeline.enable_model_cpu_offload()
         self.pipeline = pipeline.to(self.device)
         self.pipeline.enable_vae_slicing()
         self.pipeline.enable_vae_tiling()
+        print(f"[Pipeline Cache] Pipeline loaded and configured successfully (no CPU offload for caching)")
 
         if hasattr(self.pipeline.unet, "use_dino") and self.pipeline.unet.use_dino:
             from ..hunyuanpaintpbr.unet.modules import Dino_v2

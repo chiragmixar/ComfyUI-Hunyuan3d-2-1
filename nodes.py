@@ -25,7 +25,7 @@ from pathlib import Path
 #painting
 from .hy3dpaint.DifferentiableRenderer.MeshRender import MeshRender
 from .hy3dpaint.utils.simplify_mesh_utils import remesh_mesh
-from .hy3dpaint.utils.multiview_utils import multiviewDiffusionNet
+from .hy3dpaint.utils.multiview_utils import multiviewDiffusionNet, get_cached_multiview_model
 from .hy3dpaint.utils.pipeline_utils import ViewProcessor
 from .hy3dpaint.utils.image_super_utils import imageSuperNet
 from .hy3dpaint.utils.uvwrap_utils import mesh_uv_wrap
@@ -48,6 +48,62 @@ import comfy.utils
 script_directory = os.path.dirname(os.path.abspath(__file__))
 comfy_path = os.path.dirname(os.path.dirname(os.path.dirname(__file__)))
 diffusions_dir = os.path.join(comfy_path, "models", "diffusers")
+
+# ============================================================================
+# PIPELINE CACHING - Reuse pipeline instances across node executions
+# ============================================================================
+# Global cache for Hunyuan3DPaintPipeline instances
+# Key: (view_size, texture_size, ortho_scale, tuple(azims), tuple(elevs), tuple(weights))
+# Value: Hunyuan3DPaintPipeline instance
+_PAINT_PIPELINE_CACHE = {}
+
+def get_cached_paint_pipeline(view_size, camera_config, texture_size):
+    """
+    Get a cached Hunyuan3DPaintPipeline instance or create a new one.
+    This avoids recreating the pipeline (and reloading models) on each generation.
+    """
+    global _PAINT_PIPELINE_CACHE
+    
+    # Create a cache key from the parameters that affect pipeline configuration
+    cache_key = (
+        view_size,
+        texture_size,
+        camera_config["ortho_scale"],
+        tuple(camera_config["selected_camera_azims"]),
+        tuple(camera_config["selected_camera_elevs"]),
+        tuple(camera_config["selected_view_weights"]),
+    )
+    
+    if cache_key not in _PAINT_PIPELINE_CACHE:
+        print(f"[Node Pipeline Cache] Creating new Hunyuan3DPaintPipeline (cache miss)")
+        conf = Hunyuan3DPaintConfig(
+            view_size, 
+            camera_config["selected_camera_azims"], 
+            camera_config["selected_camera_elevs"], 
+            camera_config["selected_view_weights"], 
+            camera_config["ortho_scale"], 
+            texture_size
+        )
+        _PAINT_PIPELINE_CACHE[cache_key] = Hunyuan3DPaintPipeline(conf)
+        print(f"[Node Pipeline Cache] Pipeline cached successfully")
+    else:
+        print(f"[Node Pipeline Cache] Reusing cached Hunyuan3DPaintPipeline (cache hit)")
+    
+    return _PAINT_PIPELINE_CACHE[cache_key]
+
+def clear_paint_pipeline_cache():
+    """Clear the global paint pipeline cache to free memory."""
+    global _PAINT_PIPELINE_CACHE
+    for key in list(_PAINT_PIPELINE_CACHE.keys()):
+        pipeline = _PAINT_PIPELINE_CACHE[key]
+        try:
+            pipeline.clean_memory()
+        except:
+            pass
+    _PAINT_PIPELINE_CACHE.clear()
+    torch.cuda.empty_cache()
+    print("[Node Pipeline Cache] Cleared paint pipeline cache")
+# ============================================================================
 
 def parse_string_to_int_list(number_string):
   """
@@ -422,8 +478,8 @@ class Hy3DMultiViewsGenerator:
         
         seed = seed % (2**32)
         
-        conf = Hunyuan3DPaintConfig(view_size, camera_config["selected_camera_azims"], camera_config["selected_camera_elevs"], camera_config["selected_view_weights"], camera_config["ortho_scale"], texture_size)
-        paint_pipeline = Hunyuan3DPaintPipeline(conf)
+        # Use cached pipeline to avoid recreating and reloading models on each call
+        paint_pipeline = get_cached_paint_pipeline(view_size, camera_config, texture_size)
         
         image = tensor2pil(image)
         
@@ -527,13 +583,12 @@ class Hy3DInPaint:
         
         output_glb_path = f"{output_mesh_name}.glb"
         
-        pipeline.clean_memory()
+        # NOTE: Pipeline is cached globally, do NOT clean it up here.
+        # This enables faster subsequent generations by reusing the loaded models.
+        # To manually clear the cache, call clear_paint_pipeline_cache()
         
-        del pipeline
-        
+        # Only clear temporary CUDA cache, not the pipeline itself
         mm.soft_empty_cache()
-        torch.cuda.empty_cache()
-        gc.collect()        
         
         return (texture_tensor, texture_mr_tensor, trimesh, output_glb_path)         
         
