@@ -844,6 +844,93 @@ class Hy3D21ResizeImages:
             raise Exception("Unsupported images format")                     
         
         return (images, )
+
+# Global cache for RealESRGAN upscaler to avoid reloading
+_REALESRGAN_CACHE = {}
+
+def get_cached_realesrgan(ckpt_path):
+    """Get or create a cached RealESRGAN upscaler instance."""
+    global _REALESRGAN_CACHE
+    if ckpt_path not in _REALESRGAN_CACHE:
+        from realesrgan import RealESRGANer
+        from basicsr.archs.rrdbnet_arch import RRDBNet
+        
+        model = RRDBNet(num_in_ch=3, num_out_ch=3, num_feat=64, num_block=23, num_grow_ch=32, scale=4)
+        upsampler = RealESRGANer(
+            scale=4,
+            model_path=ckpt_path,
+            dni_weight=None,
+            model=model,
+            tile=0,
+            tile_pad=10,
+            pre_pad=0,
+            half=True,
+            gpu_id=None,
+        )
+        _REALESRGAN_CACHE[ckpt_path] = upsampler
+        print(f"[Hy3DRealESRGANUpscaler] Loaded RealESRGAN model from {ckpt_path}")
+    return _REALESRGAN_CACHE[ckpt_path]
+
+class Hy3DRealESRGANUpscaler:
+    """
+    RealESRGAN 4x Upscaler for Hunyuan3D texture enhancement.
+    Uses the same upscaling model as the original texture generation pipeline.
+    """
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "images": ("IMAGE", {"tooltip": "Input images to upscale (4x)"}),
+                "model_path": ("STRING", {
+                    "default": "hy3dpaint/ckpt/RealESRGAN_x4plus.pth",
+                    "tooltip": "Path to RealESRGAN checkpoint relative to ComfyUI root"
+                }),
+            },
+        }
+
+    RETURN_TYPES = ("IMAGE",)
+    RETURN_NAMES = ("upscaled_images",)
+    FUNCTION = "upscale"
+    CATEGORY = "Hunyuan3D21Wrapper"
+
+    def upscale(self, images, model_path):
+        # Resolve model path relative to script directory or absolute
+        if not os.path.isabs(model_path):
+            # Try relative to script directory first
+            ckpt_path = os.path.join(script_directory, model_path)
+            if not os.path.exists(ckpt_path):
+                # Try relative to comfy path
+                ckpt_path = os.path.join(comfy_path, model_path)
+        else:
+            ckpt_path = model_path
+            
+        if not os.path.exists(ckpt_path):
+            raise FileNotFoundError(f"RealESRGAN checkpoint not found at: {ckpt_path}")
+        
+        upsampler = get_cached_realesrgan(ckpt_path)
+        
+        # Convert tensor images to PIL, upscale, convert back
+        if isinstance(images, torch.Tensor):
+            pil_images = convert_tensor_images_to_pil(images)
+        elif isinstance(images, List):
+            pil_images = images
+        else:
+            pil_images = [images]
+        
+        upscaled_images = []
+        for img in pil_images:
+            if isinstance(img, torch.Tensor):
+                img = tensor2pil(img)
+            # RealESRGAN expects numpy array
+            img_np = np.array(img)
+            output, _ = upsampler.enhance(img_np)
+            upscaled_pil = Image.fromarray(output)
+            upscaled_images.append(upscaled_pil)
+        
+        # Convert back to tensor format expected by ComfyUI
+        result_tensor = hy3dpaintimages_to_tensor(upscaled_images)
+        
+        return (result_tensor,)
         
 class Hy3D21LoadImageWithTransparency:
     @classmethod
@@ -2037,6 +2124,7 @@ NODE_CLASS_MAPPINGS = {
     "Hy3DBakeMultiViewsWithMetaData": Hy3DBakeMultiViewsWithMetaData,
     "Hy3DHighPolyToLowPolyBakeMultiViewsWithMetaData": Hy3DHighPolyToLowPolyBakeMultiViewsWithMetaData,
     "Hy3D21SimpleMeshlibDecimate": Hy3D21SimpleMeshlibDecimate,
+    "Hy3DRealESRGANUpscaler": Hy3DRealESRGANUpscaler,
     #"Hy3D21MultiViewsMeshGenerator": Hy3D21MultiViewsMeshGenerator,
     }
     
@@ -2065,5 +2153,6 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "Hy3DBakeMultiViewsWithMetaData": "Hunyuan 3D 2.1 Bake MultiViews With MetaData",
     "Hy3DHighPolyToLowPolyBakeMultiViewsWithMetaData": "Hunyuan 3D 2.1 HighPoly to LowPoly Bake MultiViews With MetaData",
     "Hy3D21SimpleMeshlibDecimate": "Hunyuan 3D 2.1 Simple Meshlib Decimation",
+    "Hy3DRealESRGANUpscaler": "Hunyuan 3D 2.1 RealESRGAN 4x Upscaler",
     #"Hy3D21MultiViewsMeshGenerator": "Hunyuan 3D 2.1 MultiViews Mesh Generator"
     }
