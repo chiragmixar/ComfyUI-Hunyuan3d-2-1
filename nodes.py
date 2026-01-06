@@ -875,41 +875,31 @@ class Hy3DRealESRGANUpscaler:
     """
     RealESRGAN 4x Upscaler for Hunyuan3D texture enhancement.
     Uses the same upscaling model as the original texture generation pipeline.
+    Place between MultiViewsGenerator and BakeMultiViews in the workflow.
     """
     @classmethod
     def INPUT_TYPES(s):
         return {
             "required": {
-                "images": ("IMAGE", {"tooltip": "Input images to upscale (4x)"}),
+                "albedo": ("IMAGE", {"tooltip": "Albedo multiview images from MultiViewsGenerator"}),
+                "mr": ("IMAGE", {"tooltip": "Metallic-Roughness multiview images from MultiViewsGenerator"}),
+            },
+            "optional": {
                 "model_path": ("STRING", {
                     "default": "hy3dpaint/ckpt/RealESRGAN_x4plus.pth",
-                    "tooltip": "Path to RealESRGAN checkpoint relative to ComfyUI root"
+                    "tooltip": "Path to RealESRGAN checkpoint"
                 }),
             },
         }
 
-    RETURN_TYPES = ("IMAGE",)
-    RETURN_NAMES = ("upscaled_images",)
+    RETURN_TYPES = ("IMAGE", "IMAGE",)
+    RETURN_NAMES = ("albedo", "mr",)
     FUNCTION = "upscale"
     CATEGORY = "Hunyuan3D21Wrapper"
 
-    def upscale(self, images, model_path):
-        # Resolve model path relative to script directory or absolute
-        if not os.path.isabs(model_path):
-            # Try relative to script directory first
-            ckpt_path = os.path.join(script_directory, model_path)
-            if not os.path.exists(ckpt_path):
-                # Try relative to comfy path
-                ckpt_path = os.path.join(comfy_path, model_path)
-        else:
-            ckpt_path = model_path
-            
-        if not os.path.exists(ckpt_path):
-            raise FileNotFoundError(f"RealESRGAN checkpoint not found at: {ckpt_path}")
-        
-        upsampler = get_cached_realesrgan(ckpt_path)
-        
-        # Convert tensor images to PIL, upscale, convert back
+    def _upscale_images(self, images, upsampler):
+        """Upscale a batch of images using RealESRGAN."""
+        # Convert tensor images to PIL
         if isinstance(images, torch.Tensor):
             pil_images = convert_tensor_images_to_pil(images)
         elif isinstance(images, List):
@@ -928,9 +918,31 @@ class Hy3DRealESRGANUpscaler:
             upscaled_images.append(upscaled_pil)
         
         # Convert back to tensor format expected by ComfyUI
-        result_tensor = hy3dpaintimages_to_tensor(upscaled_images)
+        return hy3dpaintimages_to_tensor(upscaled_images)
+
+    def upscale(self, albedo, mr, model_path="hy3dpaint/ckpt/RealESRGAN_x4plus.pth"):
+        # Resolve model path relative to script directory or absolute
+        if not os.path.isabs(model_path):
+            # Try relative to script directory first
+            ckpt_path = os.path.join(script_directory, model_path)
+            if not os.path.exists(ckpt_path):
+                # Try relative to comfy path
+                ckpt_path = os.path.join(comfy_path, model_path)
+        else:
+            ckpt_path = model_path
+            
+        if not os.path.exists(ckpt_path):
+            raise FileNotFoundError(f"RealESRGAN checkpoint not found at: {ckpt_path}")
         
-        return (result_tensor,)
+        upsampler = get_cached_realesrgan(ckpt_path)
+        
+        print(f"[Hy3DRealESRGANUpscaler] Upscaling albedo images (4x)...")
+        albedo_upscaled = self._upscale_images(albedo, upsampler)
+        
+        print(f"[Hy3DRealESRGANUpscaler] Upscaling mr images (4x)...")
+        mr_upscaled = self._upscale_images(mr, upsampler)
+        
+        return (albedo_upscaled, mr_upscaled,)
         
 class Hy3D21LoadImageWithTransparency:
     @classmethod
