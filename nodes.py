@@ -876,6 +876,9 @@ class Hy3DRealESRGANUpscaler:
     RealESRGAN 4x Upscaler for Hunyuan3D texture enhancement.
     Uses the same upscaling model as the original texture generation pipeline.
     Place between MultiViewsGenerator and BakeMultiViews in the workflow.
+    
+    Model should be placed in: ComfyUI/models/upscale_models/
+    Download from: https://github.com/xinntao/Real-ESRGAN/releases/download/v0.1.0/RealESRGAN_x4plus.pth
     """
     @classmethod
     def INPUT_TYPES(s):
@@ -883,12 +886,7 @@ class Hy3DRealESRGANUpscaler:
             "required": {
                 "albedo": ("IMAGE", {"tooltip": "Albedo multiview images from MultiViewsGenerator"}),
                 "mr": ("IMAGE", {"tooltip": "Metallic-Roughness multiview images from MultiViewsGenerator"}),
-            },
-            "optional": {
-                "model_path": ("STRING", {
-                    "default": "hy3dpaint/ckpt/RealESRGAN_x4plus.pth",
-                    "tooltip": "Path to RealESRGAN checkpoint"
-                }),
+                "model_name": (folder_paths.get_filename_list("upscale_models"), {"tooltip": "Upscale model from ComfyUI/models/upscale_models/"}),
             },
         }
 
@@ -920,19 +918,12 @@ class Hy3DRealESRGANUpscaler:
         # Convert back to tensor format expected by ComfyUI
         return hy3dpaintimages_to_tensor(upscaled_images)
 
-    def upscale(self, albedo, mr, model_path="hy3dpaint/ckpt/RealESRGAN_x4plus.pth"):
-        # Resolve model path relative to script directory or absolute
-        if not os.path.isabs(model_path):
-            # Try relative to script directory first
-            ckpt_path = os.path.join(script_directory, model_path)
-            if not os.path.exists(ckpt_path):
-                # Try relative to comfy path
-                ckpt_path = os.path.join(comfy_path, model_path)
-        else:
-            ckpt_path = model_path
-            
-        if not os.path.exists(ckpt_path):
-            raise FileNotFoundError(f"RealESRGAN checkpoint not found at: {ckpt_path}")
+    def upscale(self, albedo, mr, model_name):
+        # Use ComfyUI's standard folder_paths to resolve the model path
+        ckpt_path = folder_paths.get_full_path("upscale_models", model_name)
+        
+        if ckpt_path is None or not os.path.exists(ckpt_path):
+            raise FileNotFoundError(f"RealESRGAN checkpoint not found: {model_name}. Please place the model in ComfyUI/models/upscale_models/")
         
         upsampler = get_cached_realesrgan(ckpt_path)
         
