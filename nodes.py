@@ -6,6 +6,40 @@ import argparse
 import copy
 import torch.nn as nn
 from torch.utils.data import DataLoader
+
+
+# ============================================================================
+# Torchvision compatibility fix for basicsr/RealESRGAN
+# Newer torchvision versions removed functional_tensor module
+# ============================================================================
+import sys
+import types
+import torchvision
+
+if not hasattr(torchvision.transforms, 'functional_tensor'):
+    # Create a mock module with required functions
+    functional_tensor = types.ModuleType('torchvision.transforms.functional_tensor')
+    
+    # Import the actual functions from the new location
+    from torchvision.transforms import functional as F
+    
+    def rgb_to_grayscale(img, num_output_channels=1):
+        if hasattr(F, 'rgb_to_grayscale'):
+            return F.rgb_to_grayscale(img, num_output_channels)
+        return F.to_grayscale(img, num_output_channels)
+    
+    def resize(img, size, interpolation=2, max_size=None, antialias=None):
+        return F.resize(img, size, interpolation, max_size, antialias)
+    
+    functional_tensor.rgb_to_grayscale = rgb_to_grayscale
+    functional_tensor.resize = resize
+    
+    # Register the mock module
+    sys.modules['torchvision.transforms.functional_tensor'] = functional_tensor
+    torchvision.transforms.functional_tensor = functional_tensor
+    print("[Hy3D Nodes] Applied torchvision.transforms.functional_tensor compatibility fix")
+# ============================================================================
+
 from torchvision.utils import save_image as imwrite
 from torchvision import transforms
 import os
