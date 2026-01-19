@@ -6,6 +6,40 @@ import argparse
 import copy
 import torch.nn as nn
 from torch.utils.data import DataLoader
+
+
+# ============================================================================
+# Torchvision compatibility fix for basicsr/RealESRGAN
+# Newer torchvision versions removed functional_tensor module
+# ============================================================================
+import sys
+import types
+import torchvision
+
+if not hasattr(torchvision.transforms, 'functional_tensor'):
+    # Create a mock module with required functions
+    functional_tensor = types.ModuleType('torchvision.transforms.functional_tensor')
+    
+    # Import the actual functions from the new location
+    from torchvision.transforms import functional as F
+    
+    def rgb_to_grayscale(img, num_output_channels=1):
+        if hasattr(F, 'rgb_to_grayscale'):
+            return F.rgb_to_grayscale(img, num_output_channels)
+        return F.to_grayscale(img, num_output_channels)
+    
+    def resize(img, size, interpolation=2, max_size=None, antialias=None):
+        return F.resize(img, size, interpolation, max_size, antialias)
+    
+    functional_tensor.rgb_to_grayscale = rgb_to_grayscale
+    functional_tensor.resize = resize
+    
+    # Register the mock module
+    sys.modules['torchvision.transforms.functional_tensor'] = functional_tensor
+    torchvision.transforms.functional_tensor = functional_tensor
+    print("[Hy3D Nodes] Applied torchvision.transforms.functional_tensor compatibility fix")
+# ============================================================================
+
 from torchvision.utils import save_image as imwrite
 from torchvision import transforms
 import os
@@ -25,7 +59,7 @@ from pathlib import Path
 #painting
 from .hy3dpaint.DifferentiableRenderer.MeshRender import MeshRender
 from .hy3dpaint.utils.simplify_mesh_utils import remesh_mesh
-from .hy3dpaint.utils.multiview_utils import multiviewDiffusionNet
+from .hy3dpaint.utils.multiview_utils import multiviewDiffusionNet, get_cached_multiview_model
 from .hy3dpaint.utils.pipeline_utils import ViewProcessor
 from .hy3dpaint.utils.image_super_utils import imageSuperNet
 from .hy3dpaint.utils.uvwrap_utils import mesh_uv_wrap
@@ -48,6 +82,62 @@ import comfy.utils
 script_directory = os.path.dirname(os.path.abspath(__file__))
 comfy_path = os.path.dirname(os.path.dirname(os.path.dirname(__file__)))
 diffusions_dir = os.path.join(comfy_path, "models", "diffusers")
+
+# ============================================================================
+# PIPELINE CACHING - Reuse pipeline instances across node executions
+# ============================================================================
+# Global cache for Hunyuan3DPaintPipeline instances
+# Key: (view_size, texture_size, ortho_scale, tuple(azims), tuple(elevs), tuple(weights))
+# Value: Hunyuan3DPaintPipeline instance
+_PAINT_PIPELINE_CACHE = {}
+
+def get_cached_paint_pipeline(view_size, camera_config, texture_size):
+    """
+    Get a cached Hunyuan3DPaintPipeline instance or create a new one.
+    This avoids recreating the pipeline (and reloading models) on each generation.
+    """
+    global _PAINT_PIPELINE_CACHE
+    
+    # Create a cache key from the parameters that affect pipeline configuration
+    cache_key = (
+        view_size,
+        texture_size,
+        camera_config["ortho_scale"],
+        tuple(camera_config["selected_camera_azims"]),
+        tuple(camera_config["selected_camera_elevs"]),
+        tuple(camera_config["selected_view_weights"]),
+    )
+    
+    if cache_key not in _PAINT_PIPELINE_CACHE:
+        print(f"[Node Pipeline Cache] Creating new Hunyuan3DPaintPipeline (cache miss)")
+        conf = Hunyuan3DPaintConfig(
+            view_size, 
+            camera_config["selected_camera_azims"], 
+            camera_config["selected_camera_elevs"], 
+            camera_config["selected_view_weights"], 
+            camera_config["ortho_scale"], 
+            texture_size
+        )
+        _PAINT_PIPELINE_CACHE[cache_key] = Hunyuan3DPaintPipeline(conf)
+        print(f"[Node Pipeline Cache] Pipeline cached successfully")
+    else:
+        print(f"[Node Pipeline Cache] Reusing cached Hunyuan3DPaintPipeline (cache hit)")
+    
+    return _PAINT_PIPELINE_CACHE[cache_key]
+
+def clear_paint_pipeline_cache():
+    """Clear the global paint pipeline cache to free memory."""
+    global _PAINT_PIPELINE_CACHE
+    for key in list(_PAINT_PIPELINE_CACHE.keys()):
+        pipeline = _PAINT_PIPELINE_CACHE[key]
+        try:
+            pipeline.clean_memory()
+        except:
+            pass
+    _PAINT_PIPELINE_CACHE.clear()
+    torch.cuda.empty_cache()
+    print("[Node Pipeline Cache] Cleared paint pipeline cache")
+# ============================================================================
 
 def parse_string_to_int_list(number_string):
   """
@@ -422,8 +512,8 @@ class Hy3DMultiViewsGenerator:
         
         seed = seed % (2**32)
         
-        conf = Hunyuan3DPaintConfig(view_size, camera_config["selected_camera_azims"], camera_config["selected_camera_elevs"], camera_config["selected_view_weights"], camera_config["ortho_scale"], texture_size)
-        paint_pipeline = Hunyuan3DPaintPipeline(conf)
+        # Use cached pipeline to avoid recreating and reloading models on each call
+        paint_pipeline = get_cached_paint_pipeline(view_size, camera_config, texture_size)
         
         image = tensor2pil(image)
         
@@ -527,13 +617,12 @@ class Hy3DInPaint:
         
         output_glb_path = f"{output_mesh_name}.glb"
         
-        pipeline.clean_memory()
+        # NOTE: Pipeline is cached globally, do NOT clean it up here.
+        # This enables faster subsequent generations by reusing the loaded models.
+        # To manually clear the cache, call clear_paint_pipeline_cache()
         
-        del pipeline
-        
+        # Only clear temporary CUDA cache, not the pipeline itself
         mm.soft_empty_cache()
-        torch.cuda.empty_cache()
-        gc.collect()        
         
         return (texture_tensor, texture_mr_tensor, trimesh, output_glb_path)         
         
@@ -789,6 +878,96 @@ class Hy3D21ResizeImages:
             raise Exception("Unsupported images format")                     
         
         return (images, )
+
+# Global cache for RealESRGAN upscaler to avoid reloading
+_REALESRGAN_CACHE = {}
+
+def get_cached_realesrgan(ckpt_path):
+    """Get or create a cached RealESRGAN upscaler instance."""
+    global _REALESRGAN_CACHE
+    if ckpt_path not in _REALESRGAN_CACHE:
+        from realesrgan import RealESRGANer
+        from basicsr.archs.rrdbnet_arch import RRDBNet
+        
+        model = RRDBNet(num_in_ch=3, num_out_ch=3, num_feat=64, num_block=23, num_grow_ch=32, scale=4)
+        upsampler = RealESRGANer(
+            scale=4,
+            model_path=ckpt_path,
+            dni_weight=None,
+            model=model,
+            tile=0,
+            tile_pad=10,
+            pre_pad=0,
+            half=True,
+            gpu_id=None,
+        )
+        _REALESRGAN_CACHE[ckpt_path] = upsampler
+        print(f"[Hy3DRealESRGANUpscaler] Loaded RealESRGAN model from {ckpt_path}")
+    return _REALESRGAN_CACHE[ckpt_path]
+
+class Hy3DRealESRGANUpscaler:
+    """
+    RealESRGAN 4x Upscaler for Hunyuan3D texture enhancement.
+    Uses the same upscaling model as the original texture generation pipeline.
+    Place between MultiViewsGenerator and BakeMultiViews in the workflow.
+    
+    Model should be placed in: ComfyUI/models/upscale_models/
+    Download from: https://github.com/xinntao/Real-ESRGAN/releases/download/v0.1.0/RealESRGAN_x4plus.pth
+    """
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "albedo": ("IMAGE", {"tooltip": "Albedo multiview images from MultiViewsGenerator"}),
+                "mr": ("IMAGE", {"tooltip": "Metallic-Roughness multiview images from MultiViewsGenerator"}),
+                "model_name": (folder_paths.get_filename_list("upscale_models"), {"tooltip": "Upscale model from ComfyUI/models/upscale_models/"}),
+            },
+        }
+
+    RETURN_TYPES = ("IMAGE", "IMAGE",)
+    RETURN_NAMES = ("albedo", "mr",)
+    FUNCTION = "upscale"
+    CATEGORY = "Hunyuan3D21Wrapper"
+
+    def _upscale_images(self, images, upsampler):
+        """Upscale a batch of images using RealESRGAN."""
+        # Convert tensor images to PIL
+        if isinstance(images, torch.Tensor):
+            pil_images = convert_tensor_images_to_pil(images)
+        elif isinstance(images, List):
+            pil_images = images
+        else:
+            pil_images = [images]
+        
+        upscaled_images = []
+        for img in pil_images:
+            if isinstance(img, torch.Tensor):
+                img = tensor2pil(img)
+            # RealESRGAN expects numpy array
+            img_np = np.array(img)
+            output, _ = upsampler.enhance(img_np)
+            upscaled_pil = Image.fromarray(output)
+            upscaled_images.append(upscaled_pil)
+        
+        # Convert back to tensor format expected by ComfyUI
+        return hy3dpaintimages_to_tensor(upscaled_images)
+
+    def upscale(self, albedo, mr, model_name):
+        # Use ComfyUI's standard folder_paths to resolve the model path
+        ckpt_path = folder_paths.get_full_path("upscale_models", model_name)
+        
+        if ckpt_path is None or not os.path.exists(ckpt_path):
+            raise FileNotFoundError(f"RealESRGAN checkpoint not found: {model_name}. Please place the model in ComfyUI/models/upscale_models/")
+        
+        upsampler = get_cached_realesrgan(ckpt_path)
+        
+        print(f"[Hy3DRealESRGANUpscaler] Upscaling albedo images (4x)...")
+        albedo_upscaled = self._upscale_images(albedo, upsampler)
+        
+        print(f"[Hy3DRealESRGANUpscaler] Upscaling mr images (4x)...")
+        mr_upscaled = self._upscale_images(mr, upsampler)
+        
+        return (albedo_upscaled, mr_upscaled,)
         
 class Hy3D21LoadImageWithTransparency:
     @classmethod
@@ -1982,6 +2161,7 @@ NODE_CLASS_MAPPINGS = {
     "Hy3DBakeMultiViewsWithMetaData": Hy3DBakeMultiViewsWithMetaData,
     "Hy3DHighPolyToLowPolyBakeMultiViewsWithMetaData": Hy3DHighPolyToLowPolyBakeMultiViewsWithMetaData,
     "Hy3D21SimpleMeshlibDecimate": Hy3D21SimpleMeshlibDecimate,
+    "Hy3DRealESRGANUpscaler": Hy3DRealESRGANUpscaler,
     #"Hy3D21MultiViewsMeshGenerator": Hy3D21MultiViewsMeshGenerator,
     }
     
@@ -2010,5 +2190,6 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "Hy3DBakeMultiViewsWithMetaData": "Hunyuan 3D 2.1 Bake MultiViews With MetaData",
     "Hy3DHighPolyToLowPolyBakeMultiViewsWithMetaData": "Hunyuan 3D 2.1 HighPoly to LowPoly Bake MultiViews With MetaData",
     "Hy3D21SimpleMeshlibDecimate": "Hunyuan 3D 2.1 Simple Meshlib Decimation",
+    "Hy3DRealESRGANUpscaler": "Hunyuan 3D 2.1 RealESRGAN 4x Upscaler",
     #"Hy3D21MultiViewsMeshGenerator": "Hunyuan 3D 2.1 MultiViews Mesh Generator"
     }
