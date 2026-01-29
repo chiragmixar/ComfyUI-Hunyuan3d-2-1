@@ -81,13 +81,9 @@ class multiviewDiffusionNet:
         self.cfg = cfg
         self.mode = self.cfg.model.params.stable_diffusion_config.custom_pipeline[2:]
 
-        print(f"[Pipeline Cache] Loading model from HuggingFace Hub...")
-        model_path = huggingface_hub.snapshot_download(
-            repo_id=config.multiview_pretrained_path,
-            allow_patterns=["hunyuan3d-paintpbr-v2-1/*"],
-        )
-
-        model_path = os.path.join(model_path, "hunyuan3d-paintpbr-v2-1")
+        # Use local model path instead of HuggingFace download (pre-downloaded during build)
+        model_path = "ComfyUI/models/diffusers/hunyuan3d-paintpbr-v2-1"
+        print(f"[Pipeline Cache] Loading model from local path: {model_path}")
         
         print(f"[Pipeline Cache] Loading HunyuanPaintPipeline from {model_path}...")
         pipeline = HunyuanPaintPipeline.from_pretrained(
