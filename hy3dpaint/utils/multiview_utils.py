@@ -82,8 +82,16 @@ class multiviewDiffusionNet:
         self.mode = self.cfg.model.params.stable_diffusion_config.custom_pipeline[2:]
 
         # Use local model path instead of HuggingFace download (pre-downloaded during build)
-        model_path = "ComfyUI/models/diffusers/hunyuan3d-paintpbr-v2-1"
+        # Using absolute path since working directory may vary
+        model_path = "/src/ComfyUI/models/diffusers/hunyuan3d-paintpbr-v2-1"
         print(f"[Pipeline Cache] Loading model from local path: {model_path}")
+
+        # Verify path exists before loading
+        if not os.path.exists(model_path):
+            print(f"[Pipeline Cache] ERROR: Model path does not exist: {model_path}")
+            # Try relative path as fallback
+            model_path = "ComfyUI/models/diffusers/hunyuan3d-paintpbr-v2-1"
+            print(f"[Pipeline Cache] Trying relative path: {model_path}")
         
         print(f"[Pipeline Cache] Loading HunyuanPaintPipeline from {model_path}...")
         pipeline = HunyuanPaintPipeline.from_pretrained(
